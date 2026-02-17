@@ -1,4 +1,46 @@
 import streamlit as st
+
+st.set_page_config(
+    page_title="EDGE | Talent Shortlister",
+    page_icon="🟣",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+st.markdown("""
+<style>
+:root{
+  --edge-plum:#4B136F;
+  --edge-lilac:#E7DBF6;
+  --edge-mauve:#CBB6F3;
+  --edge-seafoam:#A8DCC7;
+  --edge-text:#2E1A3A;
+}
+
+[data-testid="stAppViewContainer"]{
+  background: linear-gradient(180deg,#FFFFFF 0%, var(--edge-lilac) 140%);
+}
+
+h1,h2,h3{ color: var(--edge-text); }
+
+.stButton>button{
+  background: var(--edge-plum);
+  color: #fff;
+  border: none;
+  border-radius: 14px;
+  padding: 0.6rem 1rem;
+  font-weight: 600;
+}
+.stButton>button:hover{ background: #3B0F59; }
+
+[data-testid="stFileUploader"] section{
+  border: 2px dashed var(--edge-mauve);
+  border-radius: 16px;
+  background: rgba(231,219,246,0.35);
+}
+</style>
+""", unsafe_allow_html=True)
+
+import streamlit as st
 import pandas as pd
 import numpy as np
 import re
