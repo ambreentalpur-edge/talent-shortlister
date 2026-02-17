@@ -21,13 +21,13 @@ def safe_str(x):
     return "" if pd.isna(x) else str(x)
 
 def norm_country(x):
-    if pd.isna(x): 
+    if pd.isna(x):
         return np.nan
     v = str(x).strip().upper()
     return v if v in VALID_COUNTRIES else v
 
 def norm_gender(x):
-    if pd.isna(x): 
+    if pd.isna(x):
         return np.nan
     v = str(x).strip().lower()
     if v in ["male", "m"]:
@@ -42,18 +42,20 @@ def norm_industry_group(x):
     if pd.isna(x):
         return np.nan
     v = str(x).strip().upper()
+    # Health = Medical/Dental mapping (as you specified)
     if v in {"HEALTH", "MEDICAL", "DENTAL", "MEDICAL/DENTAL"}:
         return "HEALTH"
     return v
 
 def parse_open_or_specific(raw, valid_set):
     """
-    Returns 'ANY' if open (any/all/both) OR multiple valid values listed.
+    Returns 'ANY' if open (any/all/both) OR multiple valid values listed (e.g., PK + PE, PK & PE).
     Returns the single valid value if exactly one.
     Returns NaN if none.
     """
     if pd.isna(raw):
         return np.nan
+
     s = str(raw).upper()
     s_nospace = re.sub(r"\s+", "", s)
 
@@ -95,18 +97,35 @@ def compute_quality_score(row):
     pr = map_quality(row.get("Preparedness"), GOOD_AVG_BAD_MAP)
     pi = map_quality(row.get("Pitch"), GOOD_AVG_BAD_MAP)
 
-    vals = [a, e, pr, pi]
-    vals = [v for v in vals if pd.notna(v)]
+    vals = [v for v in [a, e, pr, pi] if pd.notna(v)]
     if vals:
         return float(sum(vals) / len(vals))
     return np.nan
 
+def build_jd_profile(opps_df):
+    # Use the known JD fields when present; otherwise just ignore missing ones
+    jd_fields = [
+        "Job Title", "Background", "Additional Skills", "Soft Skills",
+        "Professional Background Notes", "AMS/CRM/EMR/EHR/PMS",
+        "VOIP", "Insurance Portals"
+    ]
+    for f in jd_fields:
+        if f not in opps_df.columns:
+            opps_df[f] = ""
+
+    opps_df["jd_profile"] = opps_df[jd_fields].apply(
+        lambda r: " ".join([safe_str(r[c]) for c in jd_fields if safe_str(r[c])]),
+        axis=1
+    ).str.lower()
+
+    return opps_df
+
 def eligible(opp_row, cand_row):
-    # Must-have: On Marketplace
-    if str(cand_row.get("Go_Live_Status", "")).strip().lower() != "on marketplace":
+    # Must-have: On Marketplace (robust check)
+    if "marketplace" not in str(cand_row.get("Go Live Status", "")).lower():
         return False
 
-    # Must-have: Industry
+    # Must-have: Industry group match
     if pd.notna(opp_row.get("Opportunity_Industry_Group")) and pd.notna(cand_row.get("Candidate_Industry_Group")):
         if str(opp_row["Opportunity_Industry_Group"]).upper() != str(cand_row["Candidate_Industry_Group"]).upper():
             return False
@@ -133,31 +152,16 @@ def eligible(opp_row, cand_row):
 
     return True
 
-def build_profiles(opps_df):
-    jd_fields = [
-        "Job Title", "Background", "Additional Skills", "Soft Skills",
-        "Professional Background Notes", "AMS/CRM/EMR/EHR/PMS",
-        "VOIP", "Insurance Portals"
-    ]
-    for f in jd_fields:
-        if f not in opps_df.columns:
-            opps_df[f] = ""
-    opps_df["jd_profile"] = opps_df[jd_fields].apply(
-        lambda r: " ".join([safe_str(r[c]) for c in jd_fields if safe_str(r[c])]),
-        axis=1
-    ).str.lower()
-    return opps_df
-
 def generate_unique_shortlists_all(opps_df, cands_df, pool_multiplier=12, min_pool=200):
     """
     One click: generate shortlists for all eligible opportunities.
     Enforces: a candidate can only be shortlisted for ONE opportunity.
     """
 
-    # Order opportunities: highest placements first (reduces starvation)
+    # Order: highest placements first (reduces starvation)
     opps_order = opps_df.sort_values(["Placements", "Opportunity_ID"], ascending=[False, True]).copy()
 
-    used = set()
+    used_candidates = set()
     output_rows = []
 
     for _, o in opps_order.iterrows():
@@ -171,17 +175,12 @@ def generate_unique_shortlists_all(opps_df, cands_df, pool_multiplier=12, min_po
         # Scores
         elig["Match_Score"] = elig["cand_profile"].apply(lambda t: overlap_score(o["jd_profile"], t))
 
-        if "Quality_Score" in elig.columns:
-            elig["Final_Score"] = np.where(
-                elig["Quality_Score"].notna(),
-                0.7 * elig["Match_Score"] + 0.3 * elig["Quality_Score"],
-                elig["Match_Score"]
-            )
-        else:
-            elig["Quality_Score"] = np.nan
-            elig["Final_Score"] = elig["Match_Score"]
+        elig["Final_Score"] = np.where(
+            elig["Quality_Score"].notna(),
+            0.7 * elig["Match_Score"] + 0.3 * elig["Quality_Score"],
+            elig["Match_Score"]
+        )
 
-        # Keep a candidate pool bigger than need so uniqueness still fills
         pool_n = max(min_pool, need * pool_multiplier)
         pool = elig.sort_values("Final_Score", ascending=False).head(pool_n)
 
@@ -190,25 +189,28 @@ def generate_unique_shortlists_all(opps_df, cands_df, pool_multiplier=12, min_po
             cid = r.get("Candidate_ID")
             if pd.isna(cid):
                 continue
-            if cid in used:
+
+            if cid in used_candidates:
                 continue
 
-            used.add(cid)
+            used_candidates.add(cid)
             picked += 1
 
             output_rows.append({
                 "Opportunity_ID": o.get("Opportunity_ID", ""),
+                "Opportunity_Name": o.get("Opportunity: Opportunity Name", ""),
                 "Account": o.get("Account: Account Name", ""),
                 "Job Title": o.get("Job Title", ""),
                 "Stage": o.get("Opportunity: Stage", ""),
                 "Placements": placements,
                 "Rank": picked,
                 "Candidate_ID": r.get("Candidate_ID", ""),
-                "Candidate_Name": r.get("Candidate_Name", ""),
-                "Candidate_Email": r.get("Personal_Email", ""),
+                "Candidate_Name": r.get("Candidate Name", ""),
+                "Candidate_Email": r.get("Personal Email", ""),
                 "Candidate_Country": r.get("Candidate_Country", ""),
                 "Candidate_Gender": r.get("Candidate_Gender", ""),
                 "Candidate_School": r.get("School", ""),
+                "Days_in_Marketplace": r.get("Days in Marketplace", ""),
                 "Match_Score": round(float(r.get("Match_Score", 0.0)), 4),
                 "Quality_Score": (round(float(r.get("Quality_Score", np.nan)), 4) if pd.notna(r.get("Quality_Score", np.nan)) else ""),
                 "Final_Score": round(float(r.get("Final_Score", 0.0)), 4),
@@ -239,91 +241,74 @@ if not (opp_file and cand_file):
 # ---------------- LOAD ----------------
 opps = pd.read_csv(opp_file, encoding="latin1")
 cands = pd.read_csv(cand_file, encoding="latin1")
+fb = pd.read_csv(feedback_file, encoding="latin1") if feedback_file is not None else None
+
+# Clean weird BOM characters (e.g., ï»¿Candidate Name)
+opps.columns = [c.replace("ï»¿", "").strip() for c in opps.columns]
+cands.columns = [c.replace("ï»¿", "").strip() for c in cands.columns]
+if fb is not None:
+    fb.columns = [c.replace("ï»¿", "").strip() for c in fb.columns]
 
 # ---------------- PREP OPPORTUNITIES ----------------
-# Required fields we expect to exist (but guard if missing)
-if "Form: Form Number" in opps.columns:
-    opps["Opportunity_ID"] = opps["Form: Form Number"].astype(str).str.strip()
-else:
-    opps["Opportunity_ID"] = opps.index.astype(str)
-
-opps["Placements"] = pd.to_numeric(opps.get("Placements", 1), errors="coerce").fillna(1).astype(int)
-
-# stage filtering
 if "Opportunity: Stage" not in opps.columns:
     st.error("Opportunity file is missing 'Opportunity: Stage'. Please include it in the export.")
     st.stop()
 
+opps["Opportunity_ID"] = opps["Form: Form Number"].astype(str).str.strip()
+opps["Placements"] = pd.to_numeric(opps.get("Placements", 1), errors="coerce").fillna(1).astype(int)
+
 opps["Stage_norm"] = opps["Opportunity: Stage"].astype(str).str.strip().str.upper()
 opps_use = opps[~opps["Stage_norm"].isin(EXCLUDED_STAGES)].copy()
 
-# industry group
-if "Industry" in opps_use.columns:
-    opps_use["Opportunity_Industry_Group"] = opps_use["Industry"].apply(norm_industry_group)
-else:
-    opps_use["Opportunity_Industry_Group"] = np.nan
+opps_use["Opportunity_Industry_Group"] = opps_use.get("Industry", pd.Series([np.nan] * len(opps_use))).apply(norm_industry_group)
+opps_use["Country_Filter"] = opps_use.get("Country Preference", pd.Series([np.nan] * len(opps_use))).apply(
+    lambda x: parse_open_or_specific(x, VALID_COUNTRIES)
+)
+opps_use["Gender_Filter"] = opps_use.get("Gender", pd.Series([np.nan] * len(opps_use))).apply(
+    lambda x: parse_open_or_specific(x, VALID_GENDERS)
+)
 
-# country/gender filters
-if "Country Preference" in opps_use.columns:
-    opps_use["Country_Filter"] = opps_use["Country Preference"].apply(lambda x: parse_open_or_specific(x, VALID_COUNTRIES))
-else:
-    opps_use["Country_Filter"] = np.nan
-
-if "Gender" in opps_use.columns:
-    opps_use["Gender_Filter"] = opps_use["Gender"].apply(lambda x: parse_open_or_specific(x, VALID_GENDERS))
-else:
-    opps_use["Gender_Filter"] = np.nan
-
-opps_use = build_profiles(opps_use)
+opps_use = build_jd_profile(opps_use)
 
 # ---------------- PREP CANDIDATES ----------------
-# Ensure required columns exist
-required_cand_cols = ["Candidate_ID", "Candidate_Name", "Personal Email", "School", "Go Live Status", "Country", "Gender"]
-missing = [c for c in required_cand_cols if c not in cands.columns]
-if missing:
-    st.warning(f"Candidate file is missing columns: {missing}. Matching will still run, but filters may be weaker.")
+cands["email_norm"] = cands["Personal Email"].astype(str).str.strip().str.lower()
 
-# normalize
-cands["email_norm"] = cands.get("Personal Email", pd.Series([""] * len(cands))).astype(str).str.strip().str.lower()
-cands["Personal_Email"] = cands.get("Personal Email", pd.Series([""] * len(cands))).astype(str)
+# Candidate_ID from your file (Candidate: ID)
+cands["Candidate_ID"] = cands["Candidate: ID"].astype(str)
 
-cands["Go_Live_Status"] = cands.get("Go Live Status", pd.Series([""] * len(cands))).astype(str)
 cands["Candidate_Country"] = cands.get("Country", pd.Series([np.nan] * len(cands))).apply(norm_country)
 cands["Candidate_Gender"] = cands.get("Gender", pd.Series([np.nan] * len(cands))).apply(norm_gender)
 cands["Candidate_Industry_Group"] = cands.get("School", pd.Series([np.nan] * len(cands))).apply(norm_industry_group)
 
-# candidate profile text for scoring
+# Profile text used for matching
 cands["cand_profile"] = (
-    cands.get("Candidate_Name", pd.Series([""] * len(cands))).map(safe_str) + " " +
+    cands.get("Candidate Name", pd.Series([""] * len(cands))).map(safe_str) + " " +
     cands.get("School", pd.Series([""] * len(cands))).map(safe_str) + " " +
     cands.get("Background", pd.Series([""] * len(cands))).map(safe_str) + " " +
     cands.get("Speciality", pd.Series([""] * len(cands))).map(safe_str) + " " +
     cands.get("Professional Skills", pd.Series([""] * len(cands))).map(safe_str)
 ).str.lower()
 
-# ---------------- MERGE INTERVIEW FEEDBACK (OPTIONAL) ----------------
-if feedback_file is not None:
-    fb = pd.read_csv(feedback_file, encoding="latin1")
+# ---------------- MERGE INTERVIEW FEEDBACK ----------------
+if fb is not None:
     fb["email_norm"] = fb.get("Personal Email", pd.Series([""] * len(fb))).astype(str).str.strip().str.lower()
-
-    # keep best feedback row per candidate: highest Total Score, then newest date if available
     fb["Total Score"] = pd.to_numeric(fb.get("Total Score", np.nan), errors="coerce")
     fb["Opportunity: Interview Date"] = pd.to_datetime(fb.get("Opportunity: Interview Date", np.nan), errors="coerce")
 
-    fb = fb.sort_values(
+    # Keep best feedback per candidate
+    fb_best = fb.sort_values(
         by=["email_norm", "Total Score", "Opportunity: Interview Date"],
         ascending=[True, False, False]
     ).drop_duplicates("email_norm", keep="first")
 
-    # compute quality score
-    fb["Quality_Score"] = fb.apply(compute_quality_score, axis=1)
+    fb_best["Quality_Score"] = fb_best.apply(compute_quality_score, axis=1)
 
     keep_cols = ["email_norm", "Accent", "Energy", "Preparedness", "Pitch", "Notes", "Quality_Score"]
-    for c in keep_cols:
-        if c not in fb.columns:
-            fb[c] = np.nan
+    for col in keep_cols:
+        if col not in fb_best.columns:
+            fb_best[col] = np.nan
 
-    cands = cands.merge(fb[keep_cols], on="email_norm", how="left")
+    cands = cands.merge(fb_best[keep_cols], on="email_norm", how="left")
 else:
     cands["Quality_Score"] = np.nan
     cands["Accent"] = ""
@@ -338,7 +323,6 @@ col1, col2, col3 = st.columns(3)
 col1.metric("Opportunities in file", len(opps))
 col2.metric("Eligible opportunities (by stage)", len(opps_use))
 col3.metric("Candidates in file", len(cands))
-
 st.write("Excluded stages:", ", ".join(sorted(EXCLUDED_STAGES)))
 
 # ---------------- RUN ----------------
@@ -351,7 +335,6 @@ if st.button("Generate shortlists for ALL eligible opportunities"):
         st.stop()
 
     st.success(f"Generated {len(shortlist)} shortlist rows across {shortlist['Opportunity_ID'].nunique()} opportunities.")
-
     st.dataframe(shortlist, use_container_width=True)
 
     csv_bytes = shortlist.to_csv(index=False).encode("utf-8")
