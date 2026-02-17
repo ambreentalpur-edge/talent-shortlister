@@ -1,9 +1,10 @@
 import streamlit as st
+from pathlib import Path
 from PIL import Image
 import pandas as pd
 
 # --------------------------------------------------
-# PAGE CONFIG (MUST BE FIRST STREAMLIT COMMAND)
+# PAGE CONFIG
 # --------------------------------------------------
 st.set_page_config(
     page_title="EDGE | Talent Shortlister",
@@ -25,17 +26,12 @@ st.markdown("""
   --edge-text:#2E1A3A;
 }
 
-/* Background */
 [data-testid="stAppViewContainer"]{
   background: linear-gradient(180deg,#FFFFFF 0%, var(--edge-lilac) 140%);
 }
 
-/* Headings */
-h1,h2,h3{
-  color: var(--edge-text);
-}
+h1,h2,h3{ color: var(--edge-text); }
 
-/* Buttons */
 .stButton>button{
   background: var(--edge-plum);
   color: #fff;
@@ -48,20 +44,17 @@ h1,h2,h3{
   background: #3B0F59;
 }
 
-/* File uploader */
 [data-testid="stFileUploader"] section{
   border: 2px dashed var(--edge-mauve);
   border-radius: 16px;
   background: rgba(231,219,246,0.35);
 }
 
-/* Success */
 .stSuccess{
   background-color: rgba(168,220,199,0.35);
   border-left: 6px solid var(--edge-seafoam);
 }
 
-/* Info */
 .stInfo{
   background-color: rgba(203,182,243,0.25);
   border-left: 6px solid var(--edge-mauve);
@@ -70,14 +63,16 @@ h1,h2,h3{
 """, unsafe_allow_html=True)
 
 # --------------------------------------------------
-# HEADER WITH EDGE LOGO
+# HEADER WITH SAFE LOGO LOADER
 # --------------------------------------------------
-logo = Image.open("assets/logo/Edge_Lockup_H_Plum.jpg")
+logo_path = Path("assets/Logo/Edge_Lockup_H_Plum.jpg")
 
 col1, col2 = st.columns([0.22, 0.78], vertical_alignment="center")
 
 with col1:
-    st.image(logo, use_container_width=True)
+    if logo_path.exists():
+        logo = Image.open(logo_path)
+        st.image(logo, use_container_width=True)
 
 with col2:
     st.markdown("## Talent Shortlister")
@@ -89,7 +84,17 @@ with col2:
 st.divider()
 
 # --------------------------------------------------
-# SIDEBAR – FILE UPLOADS
+# SAFE CSV READER (FIXES UTF-8 ERROR)
+# --------------------------------------------------
+def safe_read_csv(uploaded_file):
+    try:
+        return pd.read_csv(uploaded_file, encoding="utf-8")
+    except UnicodeDecodeError:
+        uploaded_file.seek(0)
+        return pd.read_csv(uploaded_file, encoding="latin1")
+
+# --------------------------------------------------
+# SIDEBAR
 # --------------------------------------------------
 st.sidebar.markdown("### Upload Files")
 
@@ -145,11 +150,16 @@ with right:
     if st.button("Validate & Shortlist", use_container_width=True, disabled=not ready):
 
         try:
-            opp_df = pd.read_csv(opp_file)
-            cand_df = pd.read_csv(cand_file)
+            opp_df = safe_read_csv(opp_file)
+            cand_df = safe_read_csv(cand_file)
 
-            # ---- BASIC DEMO SHORTLIST LOGIC ----
-            # Replace this with your real scoring logic
+            if feedback_file:
+                feedback_df = safe_read_csv(feedback_file)
+
+            # ------------------------------------------
+            # DEMO SHORTLIST LOGIC
+            # Replace with your real scoring algorithm
+            # ------------------------------------------
             shortlisted = cand_df.head(top_k)
 
             st.success("Shortlist generated successfully!")
