@@ -2,15 +2,17 @@ import streamlit as st
 from pathlib import Path
 from PIL import Image
 import pandas as pd
+import numpy as np
 import re
 
-# --- sklearn (for real scoring) ---
+# --- sklearn (for scoring) ---
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
     SKLEARN_OK = True
 except Exception:
     SKLEARN_OK = False
+
 
 # --------------------------------------------------
 # PAGE CONFIG
@@ -78,14 +80,24 @@ with c2:
 st.divider()
 
 # --------------------------------------------------
+# CONSTANTS
+# --------------------------------------------------
+VALID_COUNTRIES = {"PK", "PE", "CR"}
+VALID_GENDERS = {"MALE", "FEMALE", "OTHER"}
+
+# --------------------------------------------------
 # HELPERS
 # --------------------------------------------------
 def safe_read_csv(uploaded_file):
+    """Reads CSV with encoding fallback for Salesforce/Excel exports."""
     try:
-        return pd.read_csv(uploaded_file, encoding="utf-8")
+        df = pd.read_csv(uploaded_file, encoding="utf-8")
     except UnicodeDecodeError:
         uploaded_file.seek(0)
-        return pd.read_csv(uploaded_file, encoding="latin1")
+        df = pd.read_csv(uploaded_file, encoding="latin1")
+    # remove BOM if present
+    df.columns = [str(c).replace("ï»¿", "").strip() for c in df.columns]
+    return df
 
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
@@ -134,6 +146,68 @@ def keyword_overlap_scores(query: str, docs: list[str]) -> list[float]:
         out.append(0.0 if not qt else len(qt & dt) / max(1, len(qt)))
     return out
 
+def norm_country(x):
+    if pd.isna(x): return ""
+    return str(x).strip().upper()
+
+def norm_gender(x):
+    if pd.isna(x): return ""
+    v = str(x).strip().lower()
+    if v in {"m","male"}: return "male"
+    if v in {"f","female"}: return "female"
+    if v == "other": return "other"
+    return v
+
+def norm_industry_group(x):
+    if pd.isna(x): return ""
+    v = str(x).strip().upper()
+    # your rule: Health = Medical/Dental
+    if v in {"HEALTH", "MEDICAL", "DENTAL", "MEDICAL/DENTAL"}:
+        return "HEALTH"
+    return v
+
+def parse_open_or_specific(raw, valid_set):
+    """
+    PK or PE or CR -> returns that
+    PK + PE / PK & PE / both / any -> returns 'ANY'
+    """
+    if pd.isna(raw): 
+        return ""
+    s = str(raw).upper()
+    s_nospace = re.sub(r"\s+", "", s)
+    if any(k in s_nospace for k in ["ANY", "ALL", "BOTH"]):
+        return "ANY"
+
+    tokens = re.split(r"[,&/+\|\s]+", s)
+    tokens = [t.strip().upper() for t in tokens if t.strip()]
+    found = sorted(set([t for t in tokens if t in valid_set]))
+
+    if len(found) >= 2:
+        return "ANY"
+    if len(found) == 1:
+        return found[0]
+    return ""
+
+def background_pass(opp_background: str, cand_profile: str) -> bool:
+    """
+    Light strict filter:
+    - take up to first 10 meaningful words (len>=4) from opp background
+    - require at least one of them to appear in candidate profile
+    """
+    ob = clean_text(opp_background)
+    if not ob:
+        return True
+    terms = [w for w in re.findall(r"[a-zA-Z]{4,}", ob.lower())]
+    terms = terms[:10]
+    if not terms:
+        return True
+    prof = (cand_profile or "").lower()
+    return any(t in prof for t in terms)
+
+def marketplace_pass(go_live_val: str) -> bool:
+    return "marketplace" in str(go_live_val).lower()
+
+
 # --------------------------------------------------
 # SIDEBAR
 # --------------------------------------------------
@@ -143,12 +217,18 @@ cand_file = st.sidebar.file_uploader("Candidate Information.csv", type=["csv"])
 feedback_file = st.sidebar.file_uploader("Interview Feedback.csv (Optional)", type=["csv"])
 
 st.sidebar.markdown("---")
-top_k = st.sidebar.slider("Shortlist Size", 4, 50, 15)
-only_marketplace = st.sidebar.toggle("Only include Go Live Status = On Marketplace", value=True)
 use_feedback = st.sidebar.toggle("Use Interview Feedback as signal (recommended)", value=True)
+
+# business rule: always enforce marketplace eligibility
+st.sidebar.info("Eligibility rule enforced: Go Live Status must be On Marketplace.")
+
+# optional: allow user override for shortlist size
+override_k = st.sidebar.toggle("Override shortlist size (otherwise 4 × placements)", value=False)
+top_k = st.sidebar.slider("Shortlist Size", 4, 60, 16) if override_k else None
 
 if not SKLEARN_OK:
     st.sidebar.warning("TF-IDF not available (scikit-learn missing). Add scikit-learn to requirements.txt for better matching.")
+
 
 # --------------------------------------------------
 # MAIN STATUS
@@ -171,35 +251,46 @@ with right:
     run = st.button("Generate Shortlist", use_container_width=True, disabled=not ready)
 
 # --------------------------------------------------
-# LOAD + SELECT (so Streamlit reruns don’t break)
+# LOAD + SELECT (keep outside button to avoid Streamlit rerun issues)
 # --------------------------------------------------
 if ready:
     opp_df = safe_read_csv(opp_file)
     cand_df = safe_read_csv(cand_file)
     feedback_df = safe_read_csv(feedback_file) if (feedback_file and use_feedback) else None
 
-    opp_name_col = find_col(opp_df, ["Opportunity Name", "Opportunity: Opportunity Name", "Opportunity"])
+    # --- Identify key opportunity fields ---
+    opp_name_col = find_col(opp_df, ["Opportunity: Opportunity Name", "Opportunity Name", "Opportunity"])
+    opp_country_col = find_col(opp_df, ["Country Preference", "Country"])
+    opp_gender_col = find_col(opp_df, ["Gender"])
+    opp_industry_col = find_col(opp_df, ["Industry"])
+    opp_background_col = find_col(opp_df, ["Background"])
+    opp_placements_col = find_col(opp_df, ["Placements", "Number of Placements", "Hires", "No. of Hires"])
+
     if not opp_name_col:
         st.error("Could not find Opportunity Name column in Opportunity information.csv.")
         st.stop()
 
+    # --- Identify candidate fields ---
     cand_id_col = find_col(cand_df, ["Candidate: ID", "Candidate ID", "Candidate Id"])
     cand_name_col = find_col(cand_df, ["Candidate Name", "Name"])
-    cand_go_live_col = find_col(cand_df, ["Go Live Status", "Go Live"])
     cand_email_col = find_col(cand_df, ["Personal Email", "Email"])
+    cand_go_live_col = find_col(cand_df, ["Go Live Status", "Go Live"])
+    cand_country_col = find_col(cand_df, ["Country"])
+    cand_gender_col = find_col(cand_df, ["Gender"])
+    cand_school_col = find_col(cand_df, ["School"])  # your industry proxy
+    cand_background_col = find_col(cand_df, ["Background"])
+    cand_speciality_col = find_col(cand_df, ["Speciality", "Specialty"])
+    cand_skills_col = find_col(cand_df, ["Professional Skills", "Skills"])
     cand_filelink_col = find_col(cand_df, ["File Link", "Resume Link", "CV Link"])
 
-    # Filter eligibility
-    work_cand = cand_df.copy()
-    if only_marketplace and cand_go_live_col:
-        work_cand = work_cand[
-            work_cand[cand_go_live_col].astype(str).str.strip().str.lower().isin({"on marketplace", "marketplace"})
-        ].copy()
-
-    if work_cand.empty:
-        st.warning("No candidates left after filtering. Check Go Live Status values or turn off the filter.")
+    if not cand_id_col:
+        st.error("Candidate Information.csv must include Candidate: ID.")
+        st.stop()
+    if not cand_go_live_col:
+        st.error("Candidate Information.csv must include Go Live Status.")
         st.stop()
 
+    # --- Select opportunity ---
     opp_list = sorted(set([str(x) for x in opp_df[opp_name_col].dropna().tolist() if str(x).strip()]))
     selected = st.selectbox("Select Opportunity", options=opp_list)
 
@@ -212,24 +303,98 @@ if ready:
             st.error("Selected opportunity row not found.")
             st.stop()
 
-        # Opportunity text: keep everything (includes Additional Notes etc.)
-        opp_text = row_to_text(opp_row.iloc[0], exclude_cols=set())
+        o = opp_row.iloc[0]
 
-        # Candidate text: exclude ONLY true metadata columns (do NOT exclude "Industry")
-        cand_exclude = set()
-        for c in work_cand.columns:
-            cn = norm(c)
-            if any(k in cn for k in [
-                "candidate: id", "candidate id",
-                "content document", "contentdocument",
-                "file link", "resume link", "cv link",
-                "email", "days in marketplace"
-            ]):
-                cand_exclude.add(c)
+        # Placements => shortlist size (4 × placements)
+        placements = 1
+        if opp_placements_col and clean_text(o.get(opp_placements_col)) != "":
+            try:
+                placements = int(float(str(o.get(opp_placements_col)).strip()))
+                placements = max(1, placements)
+            except Exception:
+                placements = 1
 
-        cand_texts = work_cand.apply(lambda r: row_to_text(r, cand_exclude), axis=1).tolist()
-        empty_ratio = sum(1 for t in cand_texts if not t) / max(1, len(cand_texts))
+        shortlist_size = top_k if override_k else 4 * placements
 
+        # --- Parse must-have requirement values from opp ---
+        opp_country_filter = parse_open_or_specific(o.get(opp_country_col, ""), VALID_COUNTRIES) if opp_country_col else ""
+        opp_gender_filter = parse_open_or_specific(o.get(opp_gender_col, ""), VALID_GENDERS) if opp_gender_col else ""
+        opp_industry_filter = norm_industry_group(o.get(opp_industry_col, "")) if opp_industry_col else ""
+        opp_background_req = clean_text(o.get(opp_background_col, "")) if opp_background_col else ""
+
+        # --- Build opportunity text for scoring (includes Additional Notes etc.) ---
+        opp_text = row_to_text(o, exclude_cols=set())  # keep all columns; notes matter
+
+        # --- Prepare candidate working df ---
+        work = cand_df.copy()
+
+        # Normalize candidate columns
+        work["_cand_id"] = work[cand_id_col].astype(str).str.strip()
+        work["_go_live"] = work[cand_go_live_col].astype(str)
+        work["_country"] = work[cand_country_col].apply(norm_country) if cand_country_col else ""
+        work["_gender"] = work[cand_gender_col].apply(norm_gender) if cand_gender_col else ""
+        work["_industry"] = work[cand_school_col].apply(norm_industry_group) if cand_school_col else ""
+
+        # Candidate profile text for scoring (good-to-have)
+        def build_candidate_profile(r):
+            parts = []
+            for col in [cand_name_col, cand_school_col, cand_background_col, cand_speciality_col, cand_skills_col]:
+                if col and col in work.columns:
+                    parts.append(clean_text(r.get(col, "")))
+            return " ".join([p for p in parts if p]).strip()
+
+        work["_base_profile"] = work.apply(build_candidate_profile, axis=1)
+
+        # --- Must-have filters (strict) ---
+        before = len(work)
+
+        # 1) On Marketplace
+        work = work[work["_go_live"].apply(marketplace_pass)].copy()
+        after_marketplace = len(work)
+
+        # 2) Industry exact (if requirement present)
+        if opp_industry_filter:
+            work = work[work["_industry"].astype(str).str.upper() == opp_industry_filter.upper()].copy()
+        after_industry = len(work)
+
+        # 3) Country (if specific)
+        if opp_country_filter and opp_country_filter != "ANY":
+            work = work[work["_country"].astype(str).str.upper() == opp_country_filter.upper()].copy()
+        after_country = len(work)
+
+        # 4) Gender (if specific)
+        if opp_gender_filter and opp_gender_filter != "ANY":
+            work = work[work["_gender"].astype(str).str.lower() == opp_gender_filter.lower()].copy()
+        after_gender = len(work)
+
+        # 5) Background keyword pass (if provided)
+        if opp_background_req:
+            work = work[work["_base_profile"].apply(lambda t: background_pass(opp_background_req, t))].copy()
+        after_background = len(work)
+
+        # Show filter funnel
+        with st.expander("Eligibility funnel (must-haves)"):
+            st.write(f"Start candidates: {before}")
+            st.write(f"After Marketplace: {after_marketplace}")
+            st.write(f"After Industry: {after_industry}")
+            st.write(f"After Country: {after_country}")
+            st.write(f"After Gender: {after_gender}")
+            st.write(f"After Background: {after_background}")
+            st.write("Parsed requirements:")
+            st.write({
+                "Placements": placements,
+                "Shortlist size": shortlist_size,
+                "Industry filter": opp_industry_filter or "(none)",
+                "Country filter": opp_country_filter or "(none)",
+                "Gender filter": opp_gender_filter or "(none)",
+                "Background filter": (opp_background_req[:120] + "…") if len(opp_background_req) > 120 else (opp_background_req or "(none)")
+            })
+
+        if work.empty:
+            st.warning("No candidates left after must-have filtering. Most common causes: Industry mismatch, Country/Gender too specific, or Background too strict.")
+            st.stop()
+
+        # --- Append interview feedback to profile (good-to-have)
         fb_used = False
         if feedback_df is not None:
             fb_id_col = find_col(feedback_df, ["Candidate: ID", "Candidate ID", "Candidate Id"])
@@ -261,19 +426,23 @@ if ready:
                     )
 
             if fb_text_col and (fb_map_by_id or fb_map_by_email):
-                new_texts = []
-                for _, r in work_cand.iterrows():
-                    base = row_to_text(r, cand_exclude)
+                # build final candidate texts for scoring
+                cand_texts = []
+                for _, r in work.iterrows():
+                    base = r["_base_profile"]
                     extra = ""
-                    if cand_id_col and fb_map_by_id:
+                    if fb_map_by_id:
                         extra = fb_map_by_id.get(str(r.get(cand_id_col, "")).strip(), "")
-                    if not extra and cand_email_col and fb_map_by_email:
+                    if not extra and fb_map_by_email and cand_email_col and cand_email_col in work.columns:
                         extra = fb_map_by_email.get(str(r.get(cand_email_col, "")).strip().lower(), "")
-                    new_texts.append((base + " " + extra).strip())
-                cand_texts = new_texts
+                    cand_texts.append((base + " " + extra).strip())
                 fb_used = True
+            else:
+                cand_texts = work["_base_profile"].tolist()
+        else:
+            cand_texts = work["_base_profile"].tolist()
 
-        # Score
+        # --- Score (good-to-have) ---
         if SKLEARN_OK:
             scores = tfidf_scores(opp_text, cand_texts)
             method = "TF-IDF similarity"
@@ -281,14 +450,15 @@ if ready:
             scores = keyword_overlap_scores(opp_text, cand_texts)
             method = "Keyword overlap (fallback)"
 
-        scored = work_cand.copy()
+        scored = work.copy()
         scored["Match Score"] = scores
-        scored = scored.sort_values("Match Score", ascending=False).head(top_k)
+        scored = scored.sort_values("Match Score", ascending=False).head(shortlist_size)
 
         st.success(f"Shortlist generated using {method}." + (" (Interview feedback included)" if fb_used else ""))
 
+        # --- Display ---
         show_cols = []
-        for c in [cand_name_col, cand_email_col, cand_go_live_col, "Match Score", cand_filelink_col, cand_id_col]:
+        for c in [cand_name_col, cand_email_col, cand_go_live_col, cand_school_col, cand_country_col, cand_gender_col, "Match Score", cand_filelink_col, cand_id_col]:
             if c and c in scored.columns and c not in show_cols:
                 show_cols.append(c)
         if "Match Score" not in show_cols:
@@ -305,14 +475,12 @@ if ready:
             use_container_width=True
         )
 
-        with st.expander("Debug: What text was used for matching?"):
-            st.markdown("**Opportunity Text Used (first 800 chars):**")
+        with st.expander("Debug: Matching text preview"):
+            st.markdown("**Opportunity text used (first 800 chars):**")
             st.write((opp_text[:800] + "…") if len(opp_text) > 800 else opp_text)
-            st.markdown("**Candidate text emptiness (before feedback):**")
-            st.write(f"Empty ratio: {empty_ratio:.2%}")
             st.markdown("**Example candidate text (first row, first 400 chars):**")
-            example_text = cand_texts[0] if cand_texts else ""
-            st.write((example_text[:400] + "…") if len(example_text) > 400 else example_text)
+            ex = cand_texts[0] if cand_texts else ""
+            st.write((ex[:400] + "…") if len(ex) > 400 else ex)
 
 st.markdown("---")
 st.caption("© EDGE · Internal Use Only")
